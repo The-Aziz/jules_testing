@@ -1,0 +1,1613 @@
+You are a Senior Java Software Architect and an expert in Code Refactoring. I am providing you with a Java "God Class".
+Your Goal: Perform an Extract Class refactoring to improve maintainability and adhere to the Single ResponsibilityPrinciple.
+Constraints:
+-Identify the specific responsibilities to be extracted.
+-Output the FULL code for the new classes (no gaps or placeholders).
+-Output the FULL code for the modified original class.
+-Do not use placeholders (e.g., do not write // ... existing code).
+Input Code:
+god class code:/*/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.accumulo.core.fate;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.Serializable;
+import java.io.UncheckedIOException;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
+
+import org.apache.accumulo.core.fate.Fate.TxInfo;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.base.Preconditions;
+
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+
+public abstract class AbstractFateStore<T> implements FateStore<T> {
+
+  private static final Logger log = LoggerFactory.getLogger(AbstractFateStore.class);
+
+  // Default maximum size of 100,000 transactions before deferral is stopped and
+  // all existing transactions are processed immediately again
+  protected static final int DEFAULT_MAX_DEFERRED = 100_000;
+
+  protected final Set<FateId> reserved;
+  protected final Map<FateId,Long> deferred;
+  private final int maxDeferred;
+  private final AtomicBoolean deferredOverflow = new AtomicBoolean();
+
+  // This is incremented each time a transaction was unreserved that was non new
+  protected final SignalCount unreservedNonNewCount = new SignalCount();
+
+  // This is incremented each time a transaction is unreserved that was runnable
+  protected final SignalCount unreservedRunnableCount = new SignalCount();
+
+  public AbstractFateStore() {
+    this(DEFAULT_MAX_DEFERRED);
+  }
+
+  public AbstractFateStore(int maxDeferred) {
+    this.maxDeferred = maxDeferred;
+    this.reserved = new HashSet<>();
+    this.deferred = new HashMap<>();
+  }
+
+  public static byte[] serialize(Object o) {
+    try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        ObjectOutputStream oos = new ObjectOutputStream(baos)) {
+      oos.writeObject(o);
+      return baos.toByteArray();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  @SuppressFBWarnings(value = "OBJECT_DESERIALIZATION",
+      justification = "unsafe to store arbitrary serialized objects like this, but needed for now"
+          + " for backwards compatibility")
+  public static Object deserialize(byte[] ser) {
+    try (ByteArrayInputStream bais = new ByteArrayInputStream(ser);
+        ObjectInputStream ois = new ObjectInputStream(bais)) {
+      return ois.readObject();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    } catch (ReflectiveOperationException e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  /**
+   * Attempt to reserve the fate transaction.
+   *
+   * @param fateId The FateId
+   * @return An Optional containing the FateTxStore if the transaction was successfully reserved, or
+   *         an empty Optional if the transaction was already reserved.
+   */
+  @Override
+  public Optional<FateTxStore<T>> tryReserve(FateId fateId) {
+    synchronized (this) {
+      if (!reserved.contains(fateId)) {
+        return Optional.of(reserve(fateId));
+      }
+      return Optional.empty();
+    }
+  }
+
+  @Override
+  public FateTxStore<T> reserve(FateId fateId) {
+    synchronized (AbstractFateStore.this) {
+      while (reserved.contains(fateId)) {
+        try {
+          AbstractFateStore.this.wait(100);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException(e);
+        }
+      }
+
+      reserved.add(fateId);
+      return newFateTxStore(fateId, true);
+    }
+  }
+
+  @Override
+  public void runnable(AtomicBoolean keepWaiting, Consumer<FateId> idConsumer) {
+
+    AtomicLong seen = new AtomicLong(0);
+
+    while (keepWaiting.get() && seen.get() == 0) {
+      final long beforeCount = unreservedRunnableCount.getCount();
+      final boolean beforeDeferredOverflow = deferredOverflow.get();
+
+      try (Stream<FateIdStatus> transactions = getTransactions()) {
+        transactions.filter(fateIdStatus -> isRunnable(fateIdStatus.getStatus()))
+            .map(FateIdStatus::getFateId).filter(fateId -> {
+              synchronized (AbstractFateStore.this) {
+                var deferredTime = deferred.get(fateId);
+                if (deferredTime != null) {
+                  if ((deferredTime - System.nanoTime()) >= 0) {
+                    return false;
+                  } else {
+                    deferred.remove(fateId);
+                  }
+                }
+                return !reserved.contains(fateId);
+              }
+            }).forEach(fateId -> {
+              seen.incrementAndGet();
+              idConsumer.accept(fateId);
+            });
+      }
+
+      // If deferredOverflow was previously marked true then the deferred map
+      // would have been cleared and seen.get() should be greater than 0 as there would
+      // be a lot of transactions to process in the previous run, so we won't be sleeping here
+      if (seen.get() == 0) {
+        if (beforeCount == unreservedRunnableCount.getCount()) {
+          long waitTime = 5000;
+          synchronized (AbstractFateStore.this) {
+            if (!deferred.isEmpty()) {
+              long currTime = System.nanoTime();
+              long minWait =
+                  deferred.values().stream().mapToLong(l -> l - currTime).min().getAsLong();
+              waitTime = TimeUnit.MILLISECONDS.convert(minWait, TimeUnit.NANOSECONDS);
+            }
+          }
+
+          if (waitTime > 0) {
+            unreservedRunnableCount.waitFor(count -> count != beforeCount, waitTime,
+                keepWaiting::get);
+          }
+        }
+      }
+
+      // Reset if the current state only if it matches the state before the execution.
+      // This is to avoid a race condition where the flag was set during the run.
+      // We should ensure at least one of the FATE executors will run through the
+      // entire transaction list first before clearing the flag and allowing more
+      // deferred entries into the map again. In other words, if the before state
+      // was false and during the execution at some point it was marked true this would
+      // not reset until after the next run
+      deferredOverflow.compareAndSet(beforeDeferredOverflow, false);
+    }
+  }
+
+  @Override
+  public Stream<FateIdStatus> list() {
+    return getTransactions();
+  }
+
+  @Override
+  public ReadOnlyFateTxStore<T> read(FateId fateId) {
+    return newFateTxStore(fateId, false);
+  }
+
+  protected boolean isRunnable(TStatus status) {
+    return status == TStatus.IN_PROGRESS || status == TStatus.FAILED_IN_PROGRESS
+        || status == TStatus.SUBMITTED;
+  }
+
+  public static abstract class FateIdStatusBase implements FateIdStatus {
+    private final FateId fateId;
+
+    public FateIdStatusBase(FateId fateId) {
+      this.fateId = fateId;
+    }
+
+    @Override
+    public FateId getFateId() {
+      return fateId;
+    }
+  }
+
+  @Override
+  public boolean isDeferredOverflow() {
+    return deferredOverflow.get();
+  }
+
+  @Override
+  public int getDeferredCount() {
+    // This method is primarily used right now for unit testing but
+    // if this synchronization becomes an issue we could add an atomic
+    // counter instead to track it separately so we don't need to lock
+    synchronized (AbstractFateStore.this) {
+      return deferred.size();
+    }
+  }
+
+  protected abstract Stream<FateIdStatus> getTransactions();
+
+  protected abstract TStatus _getStatus(FateId fateId);
+
+  protected abstract FateTxStore<T> newFateTxStore(FateId fateId, boolean isReserved);
+
+  protected abstract class AbstractFateTxStoreImpl<T> implements FateTxStore<T> {
+    protected final FateId fateId;
+    protected final boolean isReserved;
+
+    protected TStatus observedStatus = null;
+
+    protected AbstractFateTxStoreImpl(FateId fateId, boolean isReserved) {
+      this.fateId = fateId;
+      this.isReserved = isReserved;
+    }
+
+    @Override
+    public TStatus waitForStatusChange(EnumSet<TStatus> expected) {
+      Preconditions.checkState(!isReserved,
+          "Attempted to wait for status change while reserved " + fateId);
+      while (true) {
+
+        long countBefore = unreservedNonNewCount.getCount();
+
+        TStatus status = _getStatus(fateId);
+        if (expected.contains(status)) {
+          return status;
+        }
+
+        unreservedNonNewCount.waitFor(count -> count != countBefore, 1000, () -> true);
+      }
+    }
+
+    @Override
+    public void unreserve(long deferTime, TimeUnit timeUnit) {
+      deferTime = TimeUnit.NANOSECONDS.convert(deferTime, timeUnit);
+
+      if (deferTime < 0) {
+        throw new IllegalArgumentException("deferTime < 0 : " + deferTime);
+      }
+
+      synchronized (AbstractFateStore.this) {
+        if (!reserved.remove(fateId)) {
+          throw new IllegalStateException("Tried to unreserve id that was not reserved " + fateId);
+        }
+
+        // notify any threads waiting to reserve
+        AbstractFateStore.this.notifyAll();
+
+        // If deferred map has overflowed then skip adding to the deferred map
+        // and clear the map and set the flag. This will cause the next execution
+        // of runnable to process all the transactions and to not defer as we
+        // have a large backlog and want to make progress
+        if (deferTime > 0 && !deferredOverflow.get()) {
+          if (deferred.size() >= maxDeferred) {
+            log.info(
+                "Deferred map overflowed with size {}, clearing and setting deferredOverflow to true",
+                deferred.size());
+            deferredOverflow.set(true);
+            deferred.clear();
+          } else {
+            deferred.put(fateId, System.nanoTime() + deferTime);
+          }
+        }
+      }
+
+      if (observedStatus != null && isRunnable(observedStatus)) {
+        unreservedRunnableCount.increment();
+      }
+
+      if (observedStatus != TStatus.NEW) {
+        unreservedNonNewCount.increment();
+      }
+    }
+
+    protected void verifyReserved(boolean isWrite) {
+      if (!isReserved && isWrite) {
+        throw new IllegalStateException("Attempted write on unreserved FATE transaction.");
+      }
+
+      if (isReserved) {
+        synchronized (AbstractFateStore.this) {
+          if (!reserved.contains(fateId)) {
+            throw new IllegalStateException("Tried to operate on unreserved transaction " + fateId);
+          }
+        }
+      }
+    }
+
+    @Override
+    public TStatus getStatus() {
+      verifyReserved(false);
+      var status = _getStatus(fateId);
+      observedStatus = status;
+      return status;
+    }
+
+    @Override
+    public FateId getID() {
+      return fateId;
+    }
+
+    protected byte[] serializeTxInfo(Serializable so) {
+      if (so instanceof String) {
+        return ("S " + so).getBytes(UTF_8);
+      } else {
+        byte[] sera = serialize(so);
+        byte[] data = new byte[sera.length + 2];
+        System.arraycopy(sera, 0, data, 2, sera.length);
+        data[0] = 'O';
+        data[1] = ' ';
+        return data;
+      }
+    }
+
+    protected Serializable deserializeTxInfo(TxInfo txInfo, byte[] data) {
+      if (data[0] == 'O') {
+        byte[] sera = new byte[data.length - 2];
+        System.arraycopy(data, 2, sera, 0, sera.length);
+        return (Serializable) deserialize(sera);
+      } else if (data[0] == 'S') {
+        return new String(data, 2, data.length - 2, UTF_8);
+      } else {
+        throw new IllegalStateException("Bad node data " + txInfo);
+      }
+    }
+  }
+}*/
+dependencies:/*/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.accumulo.core.fate;
+
+import static com.google.common.util.concurrent.Uninterruptibles.sleepUninterruptibly;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static org.apache.accumulo.core.util.LazySingletons.RANDOM;
+
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.function.Supplier;
+import java.util.stream.Stream;
+
+import org.apache.accumulo.core.fate.zookeeper.ZooReaderWriter;
+import org.apache.accumulo.core.fate.zookeeper.ZooUtil.NodeExistsPolicy;
+import org.apache.accumulo.core.fate.zookeeper.ZooUtil.NodeMissingPolicy;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.KeeperException.NoNodeException;
+import org.apache.zookeeper.KeeperException.NodeExistsException;
+import org.apache.zookeeper.data.Stat;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.base.Suppliers;
+
+//TODO use zoocache? - ACCUMULO-1297
+//TODO handle zookeeper being down gracefully - ACCUMULO-1297
+
+public class ZooStore<T> extends AbstractFateStore<T> {
+
+  private static final Logger log = LoggerFactory.getLogger(ZooStore.class);
+  private static final FateInstanceType fateInstanceType = FateInstanceType.META;
+  private String path;
+  private ZooReaderWriter zk;
+
+  private String getTXPath(FateId fateId) {
+    return path + "/tx_" + fateId.getHexTid();
+  }
+
+  public ZooStore(String path, ZooReaderWriter zk) throws KeeperException, InterruptedException {
+    this(path, zk, DEFAULT_MAX_DEFERRED);
+  }
+
+  public ZooStore(String path, ZooReaderWriter zk, int maxDeferred)
+      throws KeeperException, InterruptedException {
+    super(maxDeferred);
+    this.path = path;
+    this.zk = zk;
+
+    zk.putPersistentData(path, new byte[0], NodeExistsPolicy.SKIP);
+  }
+
+  /**
+   * For testing only
+   */
+  ZooStore() {}
+
+  @Override
+  public FateId create() {
+    while (true) {
+      try {
+        // looking at the code for SecureRandom, it appears to be thread safe
+        long tid = RANDOM.get().nextLong() & 0x7fffffffffffffffL;
+        FateId fateId = FateId.from(fateInstanceType, tid);
+        zk.putPersistentData(getTXPath(fateId), TStatus.NEW.name().getBytes(UTF_8),
+            NodeExistsPolicy.FAIL);
+        return fateId;
+      } catch (NodeExistsException nee) {
+        // exist, so just try another random #
+      } catch (KeeperException | InterruptedException e) {
+        throw new IllegalStateException(e);
+      }
+    }
+  }
+
+  private class FateTxStoreImpl extends AbstractFateTxStoreImpl<T> {
+
+    private FateTxStoreImpl(FateId fateId, boolean isReserved) {
+      super(fateId, isReserved);
+    }
+
+    private static final int RETRIES = 10;
+
+    @Override
+    public Repo<T> top() {
+      verifyReserved(false);
+
+      for (int i = 0; i < RETRIES; i++) {
+        String txpath = getTXPath(fateId);
+        try {
+          String top;
+          try {
+            top = findTop(txpath);
+            if (top == null) {
+              return null;
+            }
+          } catch (KeeperException.NoNodeException ex) {
+            throw new IllegalStateException(ex);
+          }
+
+          byte[] ser = zk.getData(txpath + "/" + top);
+          @SuppressWarnings("unchecked")
+          var deserialized = (Repo<T>) deserialize(ser);
+          return deserialized;
+        } catch (KeeperException.NoNodeException ex) {
+          log.debug("zookeeper error reading " + txpath + ": " + ex, ex);
+          sleepUninterruptibly(100, MILLISECONDS);
+          continue;
+        } catch (KeeperException | InterruptedException e) {
+          throw new IllegalStateException(e);
+        }
+      }
+      return null;
+    }
+
+    private String findTop(String txpath) throws KeeperException, InterruptedException {
+      List<String> ops = zk.getChildren(txpath);
+
+      ops = new ArrayList<>(ops);
+
+      String max = "";
+
+      for (String child : ops) {
+        if (child.startsWith("repo_") && child.compareTo(max) > 0) {
+          max = child;
+        }
+      }
+
+      if (max.equals("")) {
+        return null;
+      }
+
+      return max;
+    }
+
+    @Override
+    public void push(Repo<T> repo) throws StackOverflowException {
+      verifyReserved(true);
+
+      String txpath = getTXPath(fateId);
+      try {
+        String top = findTop(txpath);
+        if (top != null && Long.parseLong(top.split("_")[1]) > 100) {
+          throw new StackOverflowException("Repo stack size too large");
+        }
+
+        zk.putPersistentSequential(txpath + "/repo_", serialize(repo));
+      } catch (StackOverflowException soe) {
+        throw soe;
+      } catch (KeeperException | InterruptedException e) {
+        throw new IllegalStateException(e);
+      }
+    }
+
+    @Override
+    public void pop() {
+      verifyReserved(true);
+
+      try {
+        String txpath = getTXPath(fateId);
+        String top = findTop(txpath);
+        if (top == null) {
+          throw new IllegalStateException("Tried to pop when empty " + fateId);
+        }
+        zk.recursiveDelete(txpath + "/" + top, NodeMissingPolicy.SKIP);
+      } catch (KeeperException | InterruptedException e) {
+        throw new IllegalStateException(e);
+      }
+    }
+
+    @Override
+    public void setStatus(TStatus status) {
+      verifyReserved(true);
+
+      try {
+        zk.putPersistentData(getTXPath(fateId), status.name().getBytes(UTF_8),
+            NodeExistsPolicy.OVERWRITE);
+      } catch (KeeperException | InterruptedException e) {
+        throw new IllegalStateException(e);
+      }
+
+      observedStatus = status;
+    }
+
+    @Override
+    public void delete() {
+      verifyReserved(true);
+
+      try {
+        zk.recursiveDelete(getTXPath(fateId), NodeMissingPolicy.SKIP);
+      } catch (KeeperException | InterruptedException e) {
+        throw new IllegalStateException(e);
+      }
+    }
+
+    @Override
+    public void setTransactionInfo(Fate.TxInfo txInfo, Serializable so) {
+      verifyReserved(true);
+
+      try {
+        zk.putPersistentData(getTXPath(fateId) + "/" + txInfo, serializeTxInfo(so),
+            NodeExistsPolicy.OVERWRITE);
+      } catch (KeeperException | InterruptedException e2) {
+        throw new IllegalStateException(e2);
+      }
+    }
+
+    @Override
+    public Serializable getTransactionInfo(Fate.TxInfo txInfo) {
+      verifyReserved(false);
+
+      try {
+        return deserializeTxInfo(txInfo, zk.getData(getTXPath(fateId) + "/" + txInfo));
+      } catch (NoNodeException nne) {
+        return null;
+      } catch (KeeperException | InterruptedException e) {
+        throw new IllegalStateException(e);
+      }
+    }
+
+    @Override
+    public long timeCreated() {
+      verifyReserved(false);
+
+      try {
+        Stat stat = zk.getZooKeeper().exists(getTXPath(fateId), false);
+        return stat.getCtime();
+      } catch (Exception e) {
+        return 0;
+      }
+    }
+
+    @Override
+    public List<ReadOnlyRepo<T>> getStack() {
+      verifyReserved(false);
+      String txpath = getTXPath(fateId);
+
+      outer: while (true) {
+        List<String> ops;
+        try {
+          ops = zk.getChildren(txpath);
+        } catch (KeeperException.NoNodeException e) {
+          return Collections.emptyList();
+        } catch (KeeperException | InterruptedException e1) {
+          throw new IllegalStateException(e1);
+        }
+
+        ops = new ArrayList<>(ops);
+        ops.sort(Collections.reverseOrder());
+
+        ArrayList<ReadOnlyRepo<T>> dops = new ArrayList<>();
+
+        for (String child : ops) {
+          if (child.startsWith("repo_")) {
+            byte[] ser;
+            try {
+              ser = zk.getData(txpath + "/" + child);
+              @SuppressWarnings("unchecked")
+              var repo = (ReadOnlyRepo<T>) deserialize(ser);
+              dops.add(repo);
+            } catch (KeeperException.NoNodeException e) {
+              // children changed so start over
+              continue outer;
+            } catch (KeeperException | InterruptedException e) {
+              throw new IllegalStateException(e);
+            }
+          }
+        }
+
+        return dops;
+      }
+    }
+  }
+
+  @Override
+  protected TStatus _getStatus(FateId fateId) {
+    try {
+      return TStatus.valueOf(new String(zk.getData(getTXPath(fateId)), UTF_8));
+    } catch (NoNodeException nne) {
+      return TStatus.UNKNOWN;
+    } catch (KeeperException | InterruptedException e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  @Override
+  protected FateTxStore<T> newFateTxStore(FateId fateId, boolean isReserved) {
+    return new FateTxStoreImpl(fateId, isReserved);
+  }
+
+  @Override
+  protected Stream<FateIdStatus> getTransactions() {
+    try {
+      return zk.getChildren(path).stream().map(strTxid -> {
+        String hexTid = strTxid.split("_")[1];
+        FateId fateId = FateId.from(fateInstanceType, hexTid);
+        // Memoizing for two reasons. First the status may never be requested, so in that case avoid
+        // the lookup. Second, if its requested multiple times the result will always be consistent.
+        Supplier<TStatus> statusSupplier = Suppliers.memoize(() -> _getStatus(fateId));
+        return new FateIdStatusBase(fateId) {
+          @Override
+          public TStatus getStatus() {
+            return statusSupplier.get();
+          }
+        };
+      });
+    } catch (KeeperException | InterruptedException e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+}
+---------
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.accumulo.core.fate.accumulo;
+
+import static org.apache.accumulo.core.util.LazySingletons.RANDOM;
+
+import java.io.Serializable;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import org.apache.accumulo.core.client.Scanner;
+import org.apache.accumulo.core.client.TableNotFoundException;
+import org.apache.accumulo.core.clientImpl.ClientContext;
+import org.apache.accumulo.core.data.Range;
+import org.apache.accumulo.core.fate.AbstractFateStore;
+import org.apache.accumulo.core.fate.Fate.TxInfo;
+import org.apache.accumulo.core.fate.FateId;
+import org.apache.accumulo.core.fate.FateInstanceType;
+import org.apache.accumulo.core.fate.ReadOnlyRepo;
+import org.apache.accumulo.core.fate.Repo;
+import org.apache.accumulo.core.fate.StackOverflowException;
+import org.apache.accumulo.core.fate.accumulo.schema.FateSchema.RepoColumnFamily;
+import org.apache.accumulo.core.fate.accumulo.schema.FateSchema.TxColumnFamily;
+import org.apache.accumulo.core.fate.accumulo.schema.FateSchema.TxInfoColumnFamily;
+import org.apache.accumulo.core.metadata.AccumuloTable;
+import org.apache.accumulo.core.security.Authorizations;
+import org.apache.accumulo.core.util.ColumnFQ;
+import org.apache.accumulo.core.util.UtilWaitThread;
+import org.apache.hadoop.io.Text;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.base.Preconditions;
+
+public class AccumuloStore<T> extends AbstractFateStore<T> {
+
+  private static final Logger log = LoggerFactory.getLogger(AccumuloStore.class);
+
+  private final ClientContext context;
+  private final String tableName;
+
+  private static final FateInstanceType fateInstanceType = FateInstanceType.USER;
+  private static final int maxRepos = 100;
+  private static final com.google.common.collect.Range<Integer> REPO_RANGE =
+      com.google.common.collect.Range.closed(1, maxRepos);
+
+  public AccumuloStore(ClientContext context, String tableName) {
+    this(context, tableName, DEFAULT_MAX_DEFERRED);
+  }
+
+  public AccumuloStore(ClientContext context, String tableName, int maxDeferred) {
+    super(maxDeferred);
+    this.context = Objects.requireNonNull(context);
+    this.tableName = Objects.requireNonNull(tableName);
+  }
+
+  public AccumuloStore(ClientContext context) {
+    this(context, AccumuloTable.FATE.tableName());
+  }
+
+  @Override
+  public FateId create() {
+    final int maxAttempts = 5;
+
+    for (int attempt = 0; attempt < maxAttempts; attempt++) {
+      FateId fateId = getFateId();
+
+      if (attempt >= 1) {
+        log.debug("Failed to create new id: {}, trying again", fateId);
+        UtilWaitThread.sleep(100);
+      }
+
+      var status = newMutator(fateId).requireStatus().putStatus(TStatus.NEW)
+          .putCreateTime(System.currentTimeMillis()).tryMutate();
+
+      switch (status) {
+        case ACCEPTED:
+          return fateId;
+        case UNKNOWN:
+        case REJECTED:
+          continue;
+        default:
+          throw new IllegalStateException("Unknown status " + status);
+      }
+    }
+
+    throw new IllegalStateException("Failed to create new id after " + maxAttempts + " attempts");
+  }
+
+  public FateId getFateId() {
+    long tid = RANDOM.get().nextLong() & 0x7fffffffffffffffL;
+    return FateId.from(fateInstanceType, tid);
+  }
+
+  @Override
+  protected Stream<FateIdStatus> getTransactions() {
+    try {
+      Scanner scanner = context.createScanner(tableName, Authorizations.EMPTY);
+      scanner.setRange(new Range());
+      TxColumnFamily.STATUS_COLUMN.fetch(scanner);
+      return scanner.stream().onClose(scanner::close).map(e -> {
+        String hexTid = e.getKey().getRow().toString().split("_")[1];
+        FateId fateId = FateId.from(fateInstanceType, hexTid);
+        return new FateIdStatusBase(fateId) {
+          @Override
+          public TStatus getStatus() {
+            return TStatus.valueOf(e.getValue().toString());
+          }
+        };
+      });
+    } catch (TableNotFoundException e) {
+      throw new IllegalStateException(tableName + " not found!", e);
+    }
+  }
+
+  @Override
+  protected TStatus _getStatus(FateId fateId) {
+    return scanTx(scanner -> {
+      scanner.setRange(getRow(fateId));
+      TxColumnFamily.STATUS_COLUMN.fetch(scanner);
+      return scanner.stream().map(e -> TStatus.valueOf(e.getValue().toString())).findFirst()
+          .orElse(TStatus.UNKNOWN);
+    });
+  }
+
+  @Override
+  protected FateTxStore<T> newFateTxStore(FateId fateId, boolean isReserved) {
+    return new FateTxStoreImpl(fateId, isReserved);
+  }
+
+  static Range getRow(FateId fateId) {
+    return new Range("tx_" + fateId.getHexTid());
+  }
+
+  private FateMutatorImpl<T> newMutator(FateId fateId) {
+    return new FateMutatorImpl<>(context, tableName, fateId);
+  }
+
+  private <R> R scanTx(Function<Scanner,R> func) {
+    try (Scanner scanner = context.createScanner(tableName, Authorizations.EMPTY)) {
+      return func.apply(scanner);
+    } catch (TableNotFoundException e) {
+      throw new IllegalStateException(tableName + " not found!", e);
+    }
+  }
+
+  private class FateTxStoreImpl extends AbstractFateTxStoreImpl<T> {
+
+    private FateTxStoreImpl(FateId fateId, boolean isReserved) {
+      super(fateId, isReserved);
+    }
+
+    @Override
+    public Repo<T> top() {
+      verifyReserved(false);
+
+      return scanTx(scanner -> {
+        scanner.setRange(getRow(fateId));
+        scanner.setBatchSize(1);
+        scanner.fetchColumnFamily(RepoColumnFamily.NAME);
+        return scanner.stream().map(e -> {
+          @SuppressWarnings("unchecked")
+          var repo = (Repo<T>) deserialize(e.getValue().get());
+          return repo;
+        }).findFirst().orElse(null);
+      });
+    }
+
+    @Override
+    public List<ReadOnlyRepo<T>> getStack() {
+      verifyReserved(false);
+
+      return scanTx(scanner -> {
+        scanner.setRange(getRow(fateId));
+        scanner.fetchColumnFamily(RepoColumnFamily.NAME);
+        return scanner.stream().map(e -> {
+          @SuppressWarnings("unchecked")
+          var repo = (ReadOnlyRepo<T>) deserialize(e.getValue().get());
+          return repo;
+        }).collect(Collectors.toList());
+      });
+    }
+
+    @Override
+    public Serializable getTransactionInfo(TxInfo txInfo) {
+      verifyReserved(false);
+
+      try (Scanner scanner = context.createScanner(tableName, Authorizations.EMPTY)) {
+        scanner.setRange(getRow(fateId));
+
+        final ColumnFQ cq;
+        switch (txInfo) {
+          case TX_NAME:
+            cq = TxInfoColumnFamily.TX_NAME_COLUMN;
+            break;
+          case AUTO_CLEAN:
+            cq = TxInfoColumnFamily.AUTO_CLEAN_COLUMN;
+            break;
+          case EXCEPTION:
+            cq = TxInfoColumnFamily.EXCEPTION_COLUMN;
+            break;
+          case RETURN_VALUE:
+            cq = TxInfoColumnFamily.RETURN_VALUE_COLUMN;
+            break;
+          case TX_AGEOFF:
+            cq = TxInfoColumnFamily.TX_AGEOFF_COLUMN;
+            break;
+          default:
+            throw new IllegalArgumentException("Unexpected TxInfo type " + txInfo);
+        }
+        scanner.fetchColumn(cq.getColumnFamily(), cq.getColumnQualifier());
+
+        return scanner.stream().map(e -> deserializeTxInfo(txInfo, e.getValue().get())).findFirst()
+            .orElse(null);
+      } catch (TableNotFoundException e) {
+        throw new IllegalStateException(tableName + " not found!", e);
+      }
+    }
+
+    @Override
+    public long timeCreated() {
+      verifyReserved(false);
+
+      return scanTx(scanner -> {
+        scanner.setRange(getRow(fateId));
+        TxColumnFamily.CREATE_TIME_COLUMN.fetch(scanner);
+        return scanner.stream().map(e -> Long.parseLong(e.getValue().toString())).findFirst()
+            .orElse(0L);
+      });
+    }
+
+    @Override
+    public void push(Repo<T> repo) throws StackOverflowException {
+      verifyReserved(true);
+
+      Optional<Integer> top = findTop();
+
+      if (top.filter(t -> t >= maxRepos).isPresent()) {
+        throw new StackOverflowException("Repo stack size too large");
+      }
+
+      FateMutator<T> fateMutator = newMutator(fateId);
+      fateMutator.putRepo(top.map(t -> t + 1).orElse(1), repo).mutate();
+    }
+
+    @Override
+    public void pop() {
+      verifyReserved(true);
+
+      Optional<Integer> top = findTop();
+      top.ifPresent(t -> newMutator(fateId).deleteRepo(t).mutate());
+    }
+
+    @Override
+    public void setStatus(TStatus status) {
+      verifyReserved(true);
+
+      newMutator(fateId).putStatus(status).mutate();
+      observedStatus = status;
+    }
+
+    @Override
+    public void setTransactionInfo(TxInfo txInfo, Serializable so) {
+      verifyReserved(true);
+
+      final byte[] serialized = serializeTxInfo(so);
+
+      newMutator(fateId).putTxInfo(txInfo, serialized).mutate();
+    }
+
+    @Override
+    public void delete() {
+      verifyReserved(true);
+
+      newMutator(fateId).delete().mutate();
+    }
+
+    private Optional<Integer> findTop() {
+      return scanTx(scanner -> {
+        scanner.setRange(getRow(fateId));
+        scanner.setBatchSize(1);
+        scanner.fetchColumnFamily(RepoColumnFamily.NAME);
+        return scanner.stream().map(e -> restoreRepo(e.getKey().getColumnQualifier())).findFirst();
+      });
+    }
+  }
+
+  static Text invertRepo(int position) {
+    Preconditions.checkArgument(REPO_RANGE.contains(position),
+        "Position %s is not in the valid range of [0,%s]", position, maxRepos);
+    return new Text(String.format("%02d", maxRepos - position));
+  }
+
+  static Integer restoreRepo(Text invertedPosition) {
+    int position = maxRepos - Integer.parseInt(invertedPosition.toString());
+    Preconditions.checkArgument(REPO_RANGE.contains(position),
+        "Position %s is not in the valid range of [0,%s]", position, maxRepos);
+    return position;
+  }
+}
+---------
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.accumulo.core.fate.accumulo;
+
+import static org.apache.accumulo.core.fate.AbstractFateStore.serialize;
+import static org.apache.accumulo.core.fate.accumulo.AccumuloStore.getRow;
+import static org.apache.accumulo.core.fate.accumulo.AccumuloStore.invertRepo;
+
+import java.util.Objects;
+
+import org.apache.accumulo.core.client.AccumuloException;
+import org.apache.accumulo.core.client.AccumuloSecurityException;
+import org.apache.accumulo.core.client.BatchWriter;
+import org.apache.accumulo.core.client.ConditionalWriter;
+import org.apache.accumulo.core.client.MutationsRejectedException;
+import org.apache.accumulo.core.client.Scanner;
+import org.apache.accumulo.core.client.TableNotFoundException;
+import org.apache.accumulo.core.clientImpl.ClientContext;
+import org.apache.accumulo.core.data.Condition;
+import org.apache.accumulo.core.data.ConditionalMutation;
+import org.apache.accumulo.core.data.Value;
+import org.apache.accumulo.core.fate.Fate.TxInfo;
+import org.apache.accumulo.core.fate.FateId;
+import org.apache.accumulo.core.fate.ReadOnlyFateStore.TStatus;
+import org.apache.accumulo.core.fate.Repo;
+import org.apache.accumulo.core.fate.accumulo.schema.FateSchema.RepoColumnFamily;
+import org.apache.accumulo.core.fate.accumulo.schema.FateSchema.TxColumnFamily;
+import org.apache.accumulo.core.fate.accumulo.schema.FateSchema.TxInfoColumnFamily;
+import org.apache.accumulo.core.security.Authorizations;
+import org.apache.hadoop.io.Text;
+
+public class FateMutatorImpl<T> implements FateMutator<T> {
+
+  private final ClientContext context;
+  private final String tableName;
+  private final FateId fateId;
+  private final ConditionalMutation mutation;
+
+  public FateMutatorImpl(ClientContext context, String tableName, FateId fateId) {
+    this.context = Objects.requireNonNull(context);
+    this.tableName = Objects.requireNonNull(tableName);
+    this.fateId = fateId;
+    this.mutation = new ConditionalMutation(new Text("tx_" + fateId.getHexTid()));
+  }
+
+  @Override
+  public FateMutator<T> putStatus(TStatus status) {
+    TxColumnFamily.STATUS_COLUMN.put(mutation, new Value(status.name()));
+    return this;
+  }
+
+  @Override
+  public FateMutator<T> putCreateTime(long ctime) {
+    TxColumnFamily.CREATE_TIME_COLUMN.put(mutation, new Value(Long.toString(ctime)));
+    return this;
+  }
+
+  @Override
+  public FateMutator<T> putName(byte[] data) {
+    TxInfoColumnFamily.TX_NAME_COLUMN.put(mutation, new Value(data));
+    return this;
+  }
+
+  @Override
+  public FateMutator<T> putAutoClean(byte[] data) {
+    TxInfoColumnFamily.AUTO_CLEAN_COLUMN.put(mutation, new Value(data));
+    return this;
+  }
+
+  @Override
+  public FateMutator<T> putException(byte[] data) {
+    TxInfoColumnFamily.EXCEPTION_COLUMN.put(mutation, new Value(data));
+    return this;
+  }
+
+  @Override
+  public FateMutator<T> putReturnValue(byte[] data) {
+    TxInfoColumnFamily.RETURN_VALUE_COLUMN.put(mutation, new Value(data));
+    return this;
+  }
+
+  @Override
+  public FateMutator<T> putAgeOff(byte[] data) {
+    TxInfoColumnFamily.TX_AGEOFF_COLUMN.put(mutation, new Value(data));
+    return this;
+  }
+
+  @Override
+  public FateMutator<T> putTxInfo(TxInfo txInfo, byte[] data) {
+    switch (txInfo) {
+      case TX_NAME:
+        putName(data);
+        break;
+      case AUTO_CLEAN:
+        putAutoClean(data);
+        break;
+      case EXCEPTION:
+        putException(data);
+        break;
+      case RETURN_VALUE:
+        putReturnValue(data);
+        break;
+      case TX_AGEOFF:
+        putAgeOff(data);
+        break;
+      default:
+        throw new IllegalArgumentException("Unexpected TxInfo type: " + txInfo);
+    }
+    return this;
+  }
+
+  @Override
+  public FateMutator<T> putRepo(int position, Repo<T> repo) {
+    final Text cq = invertRepo(position);
+    // ensure this repo is not already set
+    mutation.addCondition(new Condition(RepoColumnFamily.NAME, cq));
+    mutation.put(RepoColumnFamily.NAME, cq, new Value(serialize(repo)));
+    return this;
+  }
+
+  @Override
+  public FateMutator<T> deleteRepo(int position) {
+    mutation.putDelete(RepoColumnFamily.NAME, invertRepo(position));
+    return this;
+  }
+
+  public FateMutator<T> delete() {
+    try (Scanner scanner = context.createScanner(tableName, Authorizations.EMPTY)) {
+      scanner.setRange(getRow(fateId));
+      scanner.forEach(
+          (key, value) -> mutation.putDelete(key.getColumnFamily(), key.getColumnQualifier()));
+    } catch (TableNotFoundException e) {
+      throw new IllegalStateException(tableName + " not found!", e);
+    }
+    return this;
+  }
+
+  /**
+   * Require that the transaction status is one of the given statuses. If no statuses are provided,
+   * require that the status column is absent.
+   *
+   * @param statuses The statuses to check against.
+   */
+  public FateMutator<T> requireStatus(TStatus... statuses) {
+    Condition condition = StatusMappingIterator.createCondition(statuses);
+    mutation.addCondition(condition);
+    return this;
+  }
+
+  @Override
+  public void mutate() {
+    var status = tryMutate();
+    if (status != Status.ACCEPTED) {
+      throw new IllegalStateException("Failed to write mutation " + status + " " + mutation);
+    }
+  }
+
+  @Override
+  public Status tryMutate() {
+    try {
+      // if there are no conditions attached, then we can use a batch writer
+      if (mutation.getConditions().isEmpty()) {
+        try (BatchWriter writer = context.createBatchWriter(tableName)) {
+          writer.addMutation(mutation);
+        } catch (MutationsRejectedException e) {
+          throw new RuntimeException(e);
+        }
+
+        return Status.ACCEPTED;
+      } else {
+        try (ConditionalWriter writer = context.createConditionalWriter(tableName)) {
+          ConditionalWriter.Result result = writer.write(mutation);
+
+          switch (result.getStatus()) {
+            case ACCEPTED:
+              return Status.ACCEPTED;
+            case REJECTED:
+              return Status.REJECTED;
+            case UNKNOWN:
+              return Status.UNKNOWN;
+            default:
+              // do not expect other statuses
+              throw new IllegalStateException(
+                  "Unhandled status for mutation " + result.getStatus());
+          }
+
+        } catch (AccumuloException | AccumuloSecurityException e) {
+          throw new RuntimeException(e);
+        }
+      }
+    } catch (TableNotFoundException e) {
+      throw new RuntimeException(e);
+    }
+  }
+}
+---------
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.accumulo.core.fate;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.Serializable;
+import java.io.UncheckedIOException;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
+
+import org.apache.accumulo.core.fate.Fate.TxInfo;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.base.Preconditions;
+
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+
+public abstract class AbstractFateStore<T> implements FateStore<T> {
+
+  private static final Logger log = LoggerFactory.getLogger(AbstractFateStore.class);
+
+  // Default maximum size of 100,000 transactions before deferral is stopped and
+  // all existing transactions are processed immediately again
+  protected static final int DEFAULT_MAX_DEFERRED = 100_000;
+
+  protected final Set<FateId> reserved;
+  protected final Map<FateId,Long> deferred;
+  private final int maxDeferred;
+  private final AtomicBoolean deferredOverflow = new AtomicBoolean();
+
+  // This is incremented each time a transaction was unreserved that was non new
+  protected final SignalCount unreservedNonNewCount = new SignalCount();
+
+  // This is incremented each time a transaction is unreserved that was runnable
+  protected final SignalCount unreservedRunnableCount = new SignalCount();
+
+  public AbstractFateStore() {
+    this(DEFAULT_MAX_DEFERRED);
+  }
+
+  public AbstractFateStore(int maxDeferred) {
+    this.maxDeferred = maxDeferred;
+    this.reserved = new HashSet<>();
+    this.deferred = new HashMap<>();
+  }
+
+  public static byte[] serialize(Object o) {
+    try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        ObjectOutputStream oos = new ObjectOutputStream(baos)) {
+      oos.writeObject(o);
+      return baos.toByteArray();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  @SuppressFBWarnings(value = "OBJECT_DESERIALIZATION",
+      justification = "unsafe to store arbitrary serialized objects like this, but needed for now"
+          + " for backwards compatibility")
+  public static Object deserialize(byte[] ser) {
+    try (ByteArrayInputStream bais = new ByteArrayInputStream(ser);
+        ObjectInputStream ois = new ObjectInputStream(bais)) {
+      return ois.readObject();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    } catch (ReflectiveOperationException e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  /**
+   * Attempt to reserve the fate transaction.
+   *
+   * @param fateId The FateId
+   * @return An Optional containing the FateTxStore if the transaction was successfully reserved, or
+   *         an empty Optional if the transaction was already reserved.
+   */
+  @Override
+  public Optional<FateTxStore<T>> tryReserve(FateId fateId) {
+    synchronized (this) {
+      if (!reserved.contains(fateId)) {
+        return Optional.of(reserve(fateId));
+      }
+      return Optional.empty();
+    }
+  }
+
+  @Override
+  public FateTxStore<T> reserve(FateId fateId) {
+    synchronized (AbstractFateStore.this) {
+      while (reserved.contains(fateId)) {
+        try {
+          AbstractFateStore.this.wait(100);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException(e);
+        }
+      }
+
+      reserved.add(fateId);
+      return newFateTxStore(fateId, true);
+    }
+  }
+
+  @Override
+  public void runnable(AtomicBoolean keepWaiting, Consumer<FateId> idConsumer) {
+
+    AtomicLong seen = new AtomicLong(0);
+
+    while (keepWaiting.get() && seen.get() == 0) {
+      final long beforeCount = unreservedRunnableCount.getCount();
+      final boolean beforeDeferredOverflow = deferredOverflow.get();
+
+      try (Stream<FateIdStatus> transactions = getTransactions()) {
+        transactions.filter(fateIdStatus -> isRunnable(fateIdStatus.getStatus()))
+            .map(FateIdStatus::getFateId).filter(fateId -> {
+              synchronized (AbstractFateStore.this) {
+                var deferredTime = deferred.get(fateId);
+                if (deferredTime != null) {
+                  if ((deferredTime - System.nanoTime()) >= 0) {
+                    return false;
+                  } else {
+                    deferred.remove(fateId);
+                  }
+                }
+                return !reserved.contains(fateId);
+              }
+            }).forEach(fateId -> {
+              seen.incrementAndGet();
+              idConsumer.accept(fateId);
+            });
+      }
+
+      // If deferredOverflow was previously marked true then the deferred map
+      // would have been cleared and seen.get() should be greater than 0 as there would
+      // be a lot of transactions to process in the previous run, so we won't be sleeping here
+      if (seen.get() == 0) {
+        if (beforeCount == unreservedRunnableCount.getCount()) {
+          long waitTime = 5000;
+          synchronized (AbstractFateStore.this) {
+            if (!deferred.isEmpty()) {
+              long currTime = System.nanoTime();
+              long minWait =
+                  deferred.values().stream().mapToLong(l -> l - currTime).min().getAsLong();
+              waitTime = TimeUnit.MILLISECONDS.convert(minWait, TimeUnit.NANOSECONDS);
+            }
+          }
+
+          if (waitTime > 0) {
+            unreservedRunnableCount.waitFor(count -> count != beforeCount, waitTime,
+                keepWaiting::get);
+          }
+        }
+      }
+
+      // Reset if the current state only if it matches the state before the execution.
+      // This is to avoid a race condition where the flag was set during the run.
+      // We should ensure at least one of the FATE executors will run through the
+      // entire transaction list first before clearing the flag and allowing more
+      // deferred entries into the map again. In other words, if the before state
+      // was false and during the execution at some point it was marked true this would
+      // not reset until after the next run
+      deferredOverflow.compareAndSet(beforeDeferredOverflow, false);
+    }
+  }
+
+  @Override
+  public Stream<FateIdStatus> list() {
+    return getTransactions();
+  }
+
+  @Override
+  public ReadOnlyFateTxStore<T> read(FateId fateId) {
+    return newFateTxStore(fateId, false);
+  }
+
+  protected boolean isRunnable(TStatus status) {
+    return status == TStatus.IN_PROGRESS || status == TStatus.FAILED_IN_PROGRESS
+        || status == TStatus.SUBMITTED;
+  }
+
+  public static abstract class FateIdStatusBase implements FateIdStatus {
+    private final FateId fateId;
+
+    public FateIdStatusBase(FateId fateId) {
+      this.fateId = fateId;
+    }
+
+    @Override
+    public FateId getFateId() {
+      return fateId;
+    }
+  }
+
+  @Override
+  public boolean isDeferredOverflow() {
+    return deferredOverflow.get();
+  }
+
+  @Override
+  public int getDeferredCount() {
+    // This method is primarily used right now for unit testing but
+    // if this synchronization becomes an issue we could add an atomic
+    // counter instead to track it separately so we don't need to lock
+    synchronized (AbstractFateStore.this) {
+      return deferred.size();
+    }
+  }
+
+  protected abstract Stream<FateIdStatus> getTransactions();
+
+  protected abstract TStatus _getStatus(FateId fateId);
+
+  protected abstract FateTxStore<T> newFateTxStore(FateId fateId, boolean isReserved);
+
+  protected abstract class AbstractFateTxStoreImpl<T> implements FateTxStore<T> {
+    protected final FateId fateId;
+    protected final boolean isReserved;
+
+    protected TStatus observedStatus = null;
+
+    protected AbstractFateTxStoreImpl(FateId fateId, boolean isReserved) {
+      this.fateId = fateId;
+      this.isReserved = isReserved;
+    }
+
+    @Override
+    public TStatus waitForStatusChange(EnumSet<TStatus> expected) {
+      Preconditions.checkState(!isReserved,
+          "Attempted to wait for status change while reserved " + fateId);
+      while (true) {
+
+        long countBefore = unreservedNonNewCount.getCount();
+
+        TStatus status = _getStatus(fateId);
+        if (expected.contains(status)) {
+          return status;
+        }
+
+        unreservedNonNewCount.waitFor(count -> count != countBefore, 1000, () -> true);
+      }
+    }
+
+    @Override
+    public void unreserve(long deferTime, TimeUnit timeUnit) {
+      deferTime = TimeUnit.NANOSECONDS.convert(deferTime, timeUnit);
+
+      if (deferTime < 0) {
+        throw new IllegalArgumentException("deferTime < 0 : " + deferTime);
+      }
+
+      synchronized (AbstractFateStore.this) {
+        if (!reserved.remove(fateId)) {
+          throw new IllegalStateException("Tried to unreserve id that was not reserved " + fateId);
+        }
+
+        // notify any threads waiting to reserve
+        AbstractFateStore.this.notifyAll();
+
+        // If deferred map has overflowed then skip adding to the deferred map
+        // and clear the map and set the flag. This will cause the next execution
+        // of runnable to process all the transactions and to not defer as we
+        // have a large backlog and want to make progress
+        if (deferTime > 0 && !deferredOverflow.get()) {
+          if (deferred.size() >= maxDeferred) {
+            log.info(
+                "Deferred map overflowed with size {}, clearing and setting deferredOverflow to true",
+                deferred.size());
+            deferredOverflow.set(true);
+            deferred.clear();
+          } else {
+            deferred.put(fateId, System.nanoTime() + deferTime);
+          }
+        }
+      }
+
+      if (observedStatus != null && isRunnable(observedStatus)) {
+        unreservedRunnableCount.increment();
+      }
+
+      if (observedStatus != TStatus.NEW) {
+        unreservedNonNewCount.increment();
+      }
+    }
+
+    protected void verifyReserved(boolean isWrite) {
+      if (!isReserved && isWrite) {
+        throw new IllegalStateException("Attempted write on unreserved FATE transaction.");
+      }
+
+      if (isReserved) {
+        synchronized (AbstractFateStore.this) {
+          if (!reserved.contains(fateId)) {
+            throw new IllegalStateException("Tried to operate on unreserved transaction " + fateId);
+          }
+        }
+      }
+    }
+
+    @Override
+    public TStatus getStatus() {
+      verifyReserved(false);
+      var status = _getStatus(fateId);
+      observedStatus = status;
+      return status;
+    }
+
+    @Override
+    public FateId getID() {
+      return fateId;
+    }
+
+    protected byte[] serializeTxInfo(Serializable so) {
+      if (so instanceof String) {
+        return ("S " + so).getBytes(UTF_8);
+      } else {
+        byte[] sera = serialize(so);
+        byte[] data = new byte[sera.length + 2];
+        System.arraycopy(sera, 0, data, 2, sera.length);
+        data[0] = 'O';
+        data[1] = ' ';
+        return data;
+      }
+    }
+
+    protected Serializable deserializeTxInfo(TxInfo txInfo, byte[] data) {
+      if (data[0] == 'O') {
+        byte[] sera = new byte[data.length - 2];
+        System.arraycopy(data, 2, sera, 0, sera.length);
+        return (Serializable) deserialize(sera);
+      } else if (data[0] == 'S') {
+        return new String(data, 2, data.length - 2, UTF_8);
+      } else {
+        throw new IllegalStateException("Bad node data " + txInfo);
+      }
+    }
+  }
+}*/
